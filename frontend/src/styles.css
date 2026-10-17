@@ -149,3 +149,11 @@ button { border: 0; cursor: pointer; }
 button:focus-visible, input:focus-visible { outline-color: var(--focus); }
 .app.light .topbar, .app.light .live-label { color: var(--text-secondary); }
 .app.light .eyebrow, .app.light .text-button, .app.light .message small { color: var(--blue); }
+.auth-screen { display: grid; place-items: center; min-height: 100vh; padding: 24px; color: #f1f6ff; background: radial-gradient(circle at 50% 20%, #168bff2c, transparent 35%), #020b17; }
+.auth-card { display: grid; gap: 13px; width: min(100%, 410px); padding: 30px; border: 1px solid #254967; border-radius: 18px; background: linear-gradient(135deg, #081a2b, #11183b); box-shadow: 0 18px 60px #0008, 0 0 28px #168bff22; }
+.auth-card h1 { margin: 0; color: #fff; font-size: 28px; }
+.auth-card p { margin: 0; color: #c0d0e5; line-height: 1.5; }
+.auth-card input { min-height: 42px; padding: 10px 12px; color: #f1f6ff; border: 1px solid #254967; border-radius: 9px; outline: 0; background: #0b2238; }
+.auth-card input::placeholder { color: #a3b7d0; opacity: 1; }
+.auth-message { color: #54e8ff !important; font-size: 13px; }
+.auth-card .text-button { justify-content: center; color: #54e8ff; }

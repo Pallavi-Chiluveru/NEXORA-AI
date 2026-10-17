@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { createClient } from "@supabase/supabase-js";
 import {
   Activity, AppWindow, ArrowLeft, Bot, Calculator, ChevronDown, Clock3,
   FileText, FolderOpen, Globe2, Github, History, Home, Mail, Menu, MessageSquare,
@@ -10,6 +11,10 @@ import "./styles.css";
 
 const API = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8765/api";
 const EVENTS = API.replace(/^http/, "ws") + "/events";
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const supabase = supabaseUrl && supabaseAnonKey ? createClient(supabaseUrl, supabaseAnonKey) : null;
+let publicAccessToken = null;
 const navItems = [
   ["home", "Home", Home], ["chat", "Chat", MessageSquare],
   ["voice", "Voice Control", Mic], ["apps", "Applications", AppWindow],
@@ -40,7 +45,11 @@ async function request(path, options = {}) {
   const timeout = setTimeout(() => controller.abort(), options.timeout || 15000);
   delete options.timeout;
   const response = await fetch(`${API}${path}`, {
-    headers: { "Content-Type": "application/json" }, ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(publicAccessToken ? { Authorization: `Bearer ${publicAccessToken}` } : {}),
+      ...(options.headers || {}),
+    }, ...options,
     signal: controller.signal,
   }).finally(() => clearTimeout(timeout));
   if (!response.ok) throw new Error((await response.json()).detail || "Backend request failed");
@@ -48,6 +57,7 @@ async function request(path, options = {}) {
 }
 
 function App() {
+  const [session, setSession] = useState(null);
   const [page, setPage] = useState("home");
   const [theme, setTheme] = useState(() => localStorage.getItem("nexora-theme") || "dark");
   const [status, setStatus] = useState({ status: "idle", message: "Click to Start Listening.", groq: "unknown", microphone: "not_checked", speech_engine: "unknown" });
@@ -60,6 +70,19 @@ function App() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
+
+  useEffect(() => {
+    if (!supabase) return undefined;
+    supabase.auth.getSession().then(({ data }) => {
+      publicAccessToken = data.session?.access_token || null;
+      setSession(data.session);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      publicAccessToken = nextSession?.access_token || null;
+      setSession(nextSession);
+    });
+    return () => listener.subscription.unsubscribe();
+  }, []);
 
   const loadConversations = async (search = historySearch) => {
     try { setConversations(await request(`/conversations?search=${encodeURIComponent(search)}`)); }
@@ -126,6 +149,7 @@ function App() {
   const refreshActivity = async () => { try { setActivity(await request("/activity")); } catch { /* status card shows backend errors */ } };
 
   useEffect(() => {
+    if (supabase && !session) return undefined;
     localStorage.setItem("nexora-theme", theme);
     request("/status").then(setStatus).catch(() => setStatus((current) => ({ ...current, status: "error", message: "Backend unavailable" })));
     loadConversations(); refreshActivity();
@@ -151,8 +175,12 @@ function App() {
       }
     };
     return () => socket.close();
-  }, []);
-  useEffect(() => { const timer = setTimeout(() => loadConversations(historySearch), 250); return () => clearTimeout(timer); }, [historySearch]);
+  }, [session]);
+  useEffect(() => {
+    if (supabase && !session) return undefined;
+    const timer = setTimeout(() => loadConversations(historySearch), 250);
+    return () => clearTimeout(timer);
+  }, [historySearch, session]);
   useEffect(() => {
     const handler = (event) => {
       const target = document.activeElement;
@@ -174,6 +202,7 @@ function App() {
   }, [status.status, toggleVoice]);
 
   const nav = (target) => { setPage(target); setMobileOpen(false); };
+  if (supabase && !session) return <AuthScreen />;
   return <div className={`app ${theme}`}><Sidebar theme={theme} page={page} nav={nav} conversations={conversations} search={historySearch} setSearch={setHistorySearch} selected={selected} select={selectConversation} newChat={newChat} mobileOpen={mobileOpen} status={status} />
     <main className="workspace">
       <header className="topbar"><button className="icon-button mobile-menu" onClick={() => setMobileOpen(true)}><Menu size={18} /></button><div className={`status-dot ${status.status}`} /><span>{status.message}</span><div className="top-actions"><button className="icon-button" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} title="Toggle theme">{theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}</button><span className="live-label">LOCAL / {status.status.toUpperCase()}</span></div></header>
@@ -188,6 +217,23 @@ function App() {
     </main>
     {toast && <button className="toast" onClick={() => setToast("")}>{toast}</button>}
   </div>;
+}
+
+function AuthScreen() {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [mode, setMode] = useState("sign_in");
+  const [message, setMessage] = useState("");
+  const submit = async (event) => {
+    event.preventDefault();
+    setMessage("");
+    const result = mode === "sign_in"
+      ? await supabase.auth.signInWithPassword({ email, password })
+      : await supabase.auth.signUp({ email, password });
+    if (result.error) setMessage(result.error.message);
+    else if (mode === "sign_up") setMessage("Check your email to confirm your account.");
+  };
+  return <div className="auth-screen"><form className="auth-card" onSubmit={submit}><span className="eyebrow">NEXORA AI</span><h1>{mode === "sign_in" ? "Sign in to your history" : "Create your account"}</h1><p>Your public conversations are private to your account.</p><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="Email address" required /><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Password" minLength={6} required /><button className="primary-button" type="submit">{mode === "sign_in" ? "Sign in" : "Create account"}</button>{message && <p className="auth-message">{message}</p>}<button className="text-button" type="button" onClick={() => setMode(mode === "sign_in" ? "sign_up" : "sign_in")}>{mode === "sign_in" ? "Need an account?" : "Already have an account?"}</button></form></div>;
 }
 
 function Sidebar({ theme, page, nav, conversations, search, setSearch, selected, select, newChat, mobileOpen, status }) {

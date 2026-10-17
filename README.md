@@ -438,16 +438,20 @@ Start command:
 uvicorn api.public_server:app --host 0.0.0.0 --port $PORT
 ```
 
-Health check: `/api/health`. Keep the Groq key server-side and never place it
-in a Vercel environment variable exposed to the browser. The public demo uses
-bounded in-memory conversation context; it is not a substitute for durable
-cloud persistence. Render's ephemeral filesystem must not be used for personal
-SQLite history.
+Health check: `/api/health`. Keep the Groq key and `DATABASE_URL` server-side
+and never place them in Vercel environment variables exposed to the browser.
+Configure `DATABASE_URL`, `SUPABASE_URL`, and `SUPABASE_ANON_KEY` in Render.
+The public demo uses Supabase Auth and PostgreSQL, with every conversation and
+message scoped to the authenticated user. The local dashboard continues to use
+SQLite and does not require Supabase authentication.
 
 ### Vercel frontend
 
-Set `VITE_API_BASE_URL` to the deployed public API URL ending in `/api`, then
-build the `frontend` directory with:
+Set `VITE_API_BASE_URL` to the deployed public API URL ending in `/api`,
+`VITE_SUPABASE_URL` to the Supabase project URL, and
+`VITE_SUPABASE_ANON_KEY` to the public Supabase anon key. The anon key is
+designed for browser use; never expose `DATABASE_URL` or `GROQ_API_KEY`.
+Then build the `frontend` directory with:
 
 ```text
 npm install

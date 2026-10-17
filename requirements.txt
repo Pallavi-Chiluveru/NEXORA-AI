@@ -6,3 +6,4 @@ PyAudio
 playwright
 fastapi
 uvicorn
+psycopg[binary]
