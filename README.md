@@ -424,6 +424,10 @@ through a visitor's speakers.
 
 ### Render backend
 
+Render uses the cloud-only dependency file `requirements-render.txt`; the
+local `requirements.txt` intentionally retains Windows microphone, speech,
+TTS, and browser dependencies.
+
 Set these environment variables in Render:
 
 ```text
