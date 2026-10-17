@@ -428,6 +428,11 @@ Render uses the cloud-only dependency file `requirements-render.txt`; the
 local `requirements.txt` intentionally retains Windows microphone, speech,
 TTS, and browser dependencies.
 
+The Blueprint targets Render's free web-service plan. Free services sleep after
+inactivity and have ephemeral local storage, so the public API must not use
+`jarvis_history.sqlite3` for production data. Conversation history is stored in
+the PostgreSQL database configured by `DATABASE_URL`.
+
 Set these environment variables in Render:
 
 ```text
