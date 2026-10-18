@@ -353,62 +353,66 @@ You can also stop the program by pressing `Ctrl+C` in the terminal.
 
 ## 🖥️ Web Dashboard
 
-JARVIS also includes a local React dashboard with a futuristic blue/cyan
-interface, light and dark themes, a glowing voice-control orb, quick actions,
-browser controls, applications, settings, recent activity, and persistent chat
-history. The dashboard is a client of the existing Python engine; it does not
-create a second microphone listener or expose the Groq API key.
+NEXORA AI uses two local services with separate responsibilities: the public API
+serves authenticated Groq chat and MongoDB history, while the loopback-only
+Windows API owns the physical microphone, local speech, and allowlisted desktop
+actions. The existing SQLite store remains available to the desktop assistant;
+cloud account history is stored in MongoDB.
 
-Conversation history is stored locally in `jarvis_history.sqlite3`. It contains
-conversation messages only and never stores API credentials.
+### Run the local dashboard and Windows assistant
 
-### Start the local backend
+Start MongoDB first and configure `.env` with `MONGODB_URI`,
+`MONGODB_DATABASE`, `JWT_SECRET_KEY`, and `GROQ_API_KEY`. Install dependencies if
+needed. The optional `run_local.bat` opens the cloud API, Windows API, and Vite
+frontend in separate terminals.
 
-Install Python dependencies if needed, then run:
+Start them manually from the project directory in three terminals:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn api.public_server:app --host 127.0.0.1 --port 8002
+```
 
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn api.server:app --host 127.0.0.1 --port 8765
 ```
 
-### Start the frontend
-
-In a second PowerShell window:
-
 ```powershell
 cd .\frontend
 npm install
-npm run dev
+npm run dev -- --host 127.0.0.1
 ```
 
-Open the local URL printed by Vite, normally
-`http://localhost:5173`. The backend binds only to `127.0.0.1`.
+Open `http://localhost:5173`. Vite sends login, AI chat, and conversation history
+to `/api` -> `http://127.0.0.1:8002`; the microphone, local speech, and computer
+actions use `/local-api` -> `http://127.0.0.1:8765`. The Windows API binds only
+to loopback. Cloud chat history remains authenticated and MongoDB-backed.
 
-The dashboard is branded **NEXORA AI — Your Intelligent Companion** and uses
-the SVG assets in `frontend/public/` for the wordmark, icon, and favicon.
+Vite proxy targets are configurable with `VITE_CLOUD_API_PROXY_TARGET` and
+`VITE_LOCAL_API_PROXY_TARGET` in `frontend/.env.local`. If you change the local
+API port, start `api.server:app` on that port and update the matching Vite
+proxy target. Production builds use `VITE_API_BASE_URL` for the cloud API and
+optionally `VITE_LOCAL_API_BASE_URL` for the local service on the user's PC. Do
+not put database or Groq secrets in Vercel.
 
-The frontend communicates with these local API surfaces:
+Verify the local service with
+`Invoke-RestMethod http://127.0.0.1:8765/api/health`. To test the microphone,
+sign in, open Chat or Voice Control, click the mic, grant microphone access,
+speak a short question, and wait for the transcript and answer. Do not run the
+terminal listener in `main.py` at the same time; both use the same microphone.
+To test computer control, enter `Open YouTube` and confirm the browser opens.
+For cloud AI, ask `What is machine learning?`; the answer should appear in the
+conversation and persist in your account history.
 
-- `GET /api/health` and `GET /api/status`
-- `POST /api/voice/start`
-- `POST /api/chat`
-- Conversation list, create, read, rename, delete, and clear endpoints
-- `POST /api/actions/command` for allowlisted existing JARVIS commands
-- `GET /api/activity`
-- `WS /api/events` for live state updates
+If local controls are unavailable while typed AI chat works, start
+`api.server:app` and check port 8765. If login or chat is unavailable, check the
+public API on port 8002, MongoDB readiness at `/api/ready`, and Groq
+configuration. Local action requests are allowlisted; arbitrary shell and
+Python execution are not supported.
 
-Use the Home orb or press the spacebar outside an input to start one real
-microphone capture through the Python assistant. Click the orb again, press the
-spacebar again, or use the visible **Stop Listening** button to cancel the
-active capture. Escape also stops an active capture when focus is not in an
-editable field. The backend uses SpeechRecognition's cancellable background
-listener and permits only one active session.
-
-The dashboard reports listening, processing, speaking, ready, and error events
-from the backend. Loading an old conversation only loads its messages; it never
-re-executes historical commands. Groq calls use the initialized client with a
-bounded timeout and no unnecessary automatic retries. TTS operations are
-serialized so overlapping requests cannot call `pyttsx3.runAndWait()` at the
-same time.
+Run the mock-safe regression checks from the repository root with
+`.\.venv\Scripts\python.exe -m unittest discover -s tests -v`, and run the
+frontend routing checks with `cd frontend; npm test`. The frontend production
+bundle can be checked with `npm run build` from `frontend`.
 
 The existing `main.py --test-speaker` mode and PyInstaller executable remain
 available. The web dashboard is a development/source workflow and is not
@@ -431,14 +435,20 @@ TTS, and browser dependencies.
 The Blueprint targets Render's free web-service plan. Free services sleep after
 inactivity and have ephemeral local storage, so the public API must not use
 `jarvis_history.sqlite3` for production data. Conversation history is stored in
-the PostgreSQL database configured by `DATABASE_URL`.
+MongoDB Atlas configured by `MONGODB_URI`.
 
 Set these environment variables in Render:
 
 ```text
 GROQ_API_KEY=your_server_side_key
-GROQ_MODEL=llama-3.1-8b-instant
+GROQ_MODEL=openai/gpt-oss-20b
 PUBLIC_FRONTEND_ORIGINS=https://your-project.vercel.app
+MONGODB_URI=mongodb+srv://username:password@cluster.mongodb.net/?retryWrites=true&w=majority
+MONGODB_DATABASE=nexora
+JWT_SECRET_KEY=your_long_random_secret
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES=30
+COOKIE_SECURE=true
+COOKIE_SAMESITE=none
 ```
 
 Start command:
@@ -447,19 +457,17 @@ Start command:
 uvicorn api.public_server:app --host 0.0.0.0 --port $PORT
 ```
 
-Health check: `/api/health`. Keep the Groq key and `DATABASE_URL` server-side
-and never place them in Vercel environment variables exposed to the browser.
-Configure `DATABASE_URL`, `SUPABASE_URL`, and `SUPABASE_ANON_KEY` in Render.
-The public demo uses Supabase Auth and PostgreSQL, with every conversation and
-message scoped to the authenticated user. The local dashboard continues to use
-SQLite and does not require Supabase authentication.
+Health check: `/api/health`; database readiness check: `/api/ready`. Keep the
+Groq key, MongoDB URI, and JWT secret server-side and never place them in Vercel
+environment variables exposed to the browser. The public demo uses FastAPI
+authentication and MongoDB Atlas, with every conversation and message scoped to
+the authenticated user. The local desktop dashboard continues to use SQLite.
 
 ### Vercel frontend
 
 Set `VITE_API_BASE_URL` to the deployed public API URL ending in `/api`,
-`VITE_SUPABASE_URL` to the Supabase project URL, and
-`VITE_SUPABASE_ANON_KEY` to the public Supabase anon key. The anon key is
-designed for browser use; never expose `DATABASE_URL` or `GROQ_API_KEY`.
+and do not add MongoDB or JWT secrets to Vercel. Authentication is handled by
+the FastAPI backend using secure cookies.
 Then build the `frontend` directory with:
 
 ```text

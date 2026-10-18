@@ -6,4 +6,8 @@ PyAudio
 playwright
 fastapi
 uvicorn
-psycopg[binary]
+websockets>=12,<16
+pymongo
+pwdlib[argon2]
+PyJWT
+email-validator

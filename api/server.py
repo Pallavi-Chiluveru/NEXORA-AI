@@ -1,4 +1,5 @@
 import asyncio
+import os
 import threading
 import time
 import uuid
@@ -11,14 +12,20 @@ from pydantic import BaseModel, Field
 
 import main
 from services.conversation_store import ConversationStore
+from services.local_actions import classify_local_action
 
 
 APP_DIR = Path(main.APP_DIR)
 store = ConversationStore(APP_DIR / "jarvis_history.sqlite3")
 app = FastAPI(title="NEXORA AI Local API")
+local_frontend_origins = [
+    origin.strip()
+    for origin in os.getenv("LOCAL_FRONTEND_ORIGINS", "").split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=list(dict.fromkeys(["http://localhost:5173", "http://127.0.0.1:5173", *local_frontend_origins])),
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -31,38 +38,70 @@ state = {
     "last_transcript": "",
     "last_response": "",
     "voice_running": False,
+    "voice_processing": False,
     "voice_conversation_id": None,
 }
 activity = []
 subscribers = set()
+subscriber_lock = threading.Lock()
 voice_lock = threading.Lock()
 command_lock = threading.Lock()
 voice_stopper = None
 voice_session_id = None
+voice_microphone = None
+voice_capture_active = False
 
 
 class TrackedMicrophone(main.sr.Microphone):
     """Report the result of the stream opened by the background listener."""
 
-    def __init__(self, ready_event):
+    def __init__(self, ready_event, closed_event):
         super().__init__()
         self.ready_event = ready_event
+        self.closed_event = closed_event
         self.stream_available = False
+        self.error = None
 
     def __enter__(self):
-        source = super().__enter__()
-        self.stream_available = self.stream is not None
-        self.ready_event.set()
-        return source
+        try:
+            source = super().__enter__()
+            self.stream_available = self.stream is not None
+            return source
+        except Exception as error:
+            self.error = error
+            self.closed_event.set()
+            raise
+        finally:
+            self.ready_event.set()
+
+    def __exit__(self, *args):
+        global voice_capture_active
+        try:
+            return super().__exit__(*args)
+        finally:
+            self.closed_event.set()
+            with voice_lock:
+                voice_capture_active = False
 
 
 def microphone_failure_status(error):
     message = str(error).lower()
-    if "permission" in message or "access" in message or "denied" in message:
+    if any(term in message for term in ("permission", "access denied", "denied", "unauthorized")):
         return "permission_denied"
-    if "device" in message or "input" in message or "no such" in message:
+    if any(term in message for term in ("device", "input", "no such", "no default", "host error", "paerrorcode -9999")):
         return "device_unavailable"
     return "error"
+
+
+def microphone_failure_message(error):
+    message = str(error).lower()
+    if "permission" in message or "access denied" in message or "denied" in message:
+        return "Windows denied microphone access. Allow desktop apps to use the microphone in Windows Privacy settings, then try again."
+    if "pyaudio" in message or "portaudio" in message or "no default" in message or "device" in message or "input" in message or "host error" in message:
+        return "No usable microphone input could be opened. Connect or select a Windows recording device, close other apps using it, and try again."
+    if "timeout" in message:
+        return "Opening the microphone timed out. Check that a Windows recording device is connected and try again."
+    return "The microphone could not be opened. Check Windows microphone permissions and recording-device settings, then try again."
 
 
 class ChatRequest(BaseModel):
@@ -83,6 +122,10 @@ class ActionRequest(BaseModel):
     command: str = Field(min_length=1, max_length=1000)
 
 
+class SpeakRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=4000)
+
+
 class VoiceStartRequest(BaseModel):
     conversation_id: str | None = None
 
@@ -100,11 +143,27 @@ def emit(event_type, **payload):
             state[key] = payload[key]
     if isinstance(payload.get("message"), str):
         state["message"] = payload["message"]
-    for subscriber in tuple(subscribers):
+    with subscriber_lock:
+        current_subscribers = tuple(subscribers)
+    for loop, queue in current_subscribers:
         try:
-            subscriber.put_nowait(event)
-        except asyncio.QueueFull:
+            loop.call_soon_threadsafe(enqueue_event, queue, event)
+        except RuntimeError:
+            with subscriber_lock:
+                subscribers.discard((loop, queue))
+
+
+def enqueue_event(queue, event):
+    """Deliver worker-thread events safely to the WebSocket event loop."""
+    if queue.full():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
             pass
+    try:
+        queue.put_nowait(event)
+    except asyncio.QueueFull:
+        pass
 
 
 def conversation_or_404(conversation_id):
@@ -257,26 +316,52 @@ def chat(request: ChatRequest):
 
 @app.post("/api/actions/command")
 def action_command(request: ActionRequest):
+    """Backward-compatible route, now subject to the same local-action allowlist."""
+    return execute_local_action(request)
+
+
+@app.post("/api/actions/execute")
+def execute_local_action(request: ActionRequest):
+    action = classify_local_action(request.command)
+    if action is None:
+        raise HTTPException(status_code=422, detail="That request is not a supported local action.")
     conversation = store.create_conversation(str(uuid.uuid4()))
-    return run_command(request.command, conversation["id"], "text")
+    result = run_command(action["command"], conversation["id"], "text")
+    message = result["messages"][-1]["content"]
+    succeeded = not message.lower().startswith(("i could not", "i couldn't", "i cannot"))
+    return {
+        "ok": succeeded,
+        "message": message,
+        "action": action["command"],
+        "question": action["question"],
+    }
+
+
+@app.post("/api/speech/speak")
+def speak_response(request: SpeakRequest):
+    if not main.speak(request.text):
+        raise HTTPException(status_code=503, detail="Local speech output is unavailable.")
+    return {"ok": True}
 
 
 @app.post("/api/voice/start")
 def start_voice(request: VoiceStartRequest = VoiceStartRequest()):
-    global voice_stopper, voice_session_id
+    global voice_stopper, voice_session_id, voice_microphone, voice_capture_active
     with voice_lock:
-        if state["voice_running"]:
-            return {"ok": False, "message": "Voice capture is already running."}
+        if state["voice_running"] or state["voice_processing"] or voice_capture_active:
+            return {"ok": False, "message": "The previous microphone session is still closing or processing. Please wait a moment and try again."}
         if request.conversation_id:
             if store.get_conversation(request.conversation_id) is None:
                 raise HTTPException(status_code=404, detail="Conversation not found")
             conversation_id = request.conversation_id
         else:
-            conversation_id = store.create_conversation(str(uuid.uuid4()))["id"]
+            conversation_id = None
         state["voice_running"] = True
+        state["voice_processing"] = False
         state["voice_conversation_id"] = conversation_id
         voice_session_id = str(uuid.uuid4())
         session_id = voice_session_id
+        voice_capture_active = True
     emit(
         "listening_starting",
         status="starting",
@@ -285,19 +370,26 @@ def start_voice(request: VoiceStartRequest = VoiceStartRequest()):
         correlation_id=session_id,
         conversation_id=conversation_id,
     )
+    microphone = None
+    closed_event = threading.Event()
     try:
         ready_event = threading.Event()
-        microphone = TrackedMicrophone(ready_event)
-        voice_stopper = main.recognizer.listen_in_background(
+        microphone = TrackedMicrophone(ready_event, closed_event)
+        voice_microphone = microphone
+        stopper = main.recognizer.listen_in_background(
             microphone,
-            lambda recognizer, audio: voice_callback(session_id, recognizer, audio),
+            lambda recognizer, audio: voice_callback(session_id, recognizer, audio, microphone),
             phrase_time_limit=10,
         )
-        if not ready_event.wait(timeout=2):
-            voice_stopper(wait_for_stop=True)
+        with voice_lock:
+            voice_stopper = stopper
+        if not ready_event.wait(timeout=5):
+            stopper(wait_for_stop=False)
+            closed_event.wait(timeout=3)
             raise RuntimeError("Microphone initialization timed out")
+        if microphone.error is not None:
+            raise microphone.error
         if not microphone.stream_available:
-            voice_stopper(wait_for_stop=True)
             raise RuntimeError("Microphone device could not be opened")
         emit(
             "microphone_available",
@@ -322,50 +414,75 @@ def start_voice(request: VoiceStartRequest = VoiceStartRequest()):
         }
     except Exception as error:
         with voice_lock:
+            stopper = voice_stopper
+            voice_stopper = None
+        if stopper is not None:
+            stopper(wait_for_stop=False)
+            closed_event.wait(timeout=3)
+        with voice_lock:
             state["voice_running"] = False
+            state["voice_processing"] = False
             state["voice_conversation_id"] = None
+            voice_session_id = None
+            voice_microphone = None
+            if closed_event.is_set() or stopper is None:
+                voice_capture_active = False
             microphone_status = microphone_failure_status(error)
+            message = microphone_failure_message(error)
             print(f"Voice start error ({type(error).__name__}): {error}")
             emit(
                 "error",
                 status="error",
-                message="The microphone could not be started.",
+                message=message,
                 microphone=microphone_status,
             )
             return {
                 "ok": False,
-                "message": "The microphone could not be started.",
+                "message": message,
                 "microphone": microphone_status,
             }
 
 
-def voice_callback(session_id, recognizer, audio):
-    global voice_stopper, voice_session_id
+def voice_callback(session_id, recognizer, audio, microphone=None):
+    global voice_stopper
+    with voice_lock:
+        if not state["voice_running"] or voice_session_id != session_id:
+            return
+        conversation_id = state["voice_conversation_id"]
+        stopper = voice_stopper
+        voice_stopper = None
+        state["voice_running"] = False
+        state["voice_processing"] = True
+    if stopper is not None:
+        stopper(wait_for_stop=False)
+    emit(
+        "speech_detected",
+        status="processing",
+        message="Speech detected. Processing...",
+        microphone="available",
+        correlation_id=session_id,
+        conversation_id=conversation_id,
+    )
+    threading.Thread(
+        target=process_voice_audio,
+        args=(session_id, recognizer, audio, microphone, conversation_id),
+        daemon=True,
+    ).start()
+
+
+def process_voice_audio(session_id, recognizer, audio, microphone, conversation_id):
+    global voice_session_id, voice_microphone
     started_at = time.perf_counter()
     try:
-        with voice_lock:
-            if not state["voice_running"] or voice_session_id != session_id:
-                return
-            conversation_id = state["voice_conversation_id"]
-            stopper = voice_stopper
-            voice_stopper = None
-            state["voice_running"] = False
-        if stopper is not None:
-            stopper(wait_for_stop=False)
-        emit(
-            "speech_detected",
-            status="processing",
-            message="Speech detected. Processing...",
-            microphone="available",
-            correlation_id=session_id,
-            conversation_id=conversation_id,
-        )
+        if microphone is not None and not microphone.closed_event.wait(timeout=3):
+            raise RuntimeError("The microphone did not close after recording")
         command = main.transcribe_audio(audio)
         if not command:
             emit(
                 "error",
                 status="idle",
-                message="I couldn't hear anything. Please try again.",
+                message="I couldn't hear any speech. Check the microphone level and try again.",
+                microphone="available",
                 correlation_id=session_id,
             )
             return
@@ -381,20 +498,22 @@ def voice_callback(session_id, recognizer, audio):
             f"[{session_id}] transcription completed in "
             f"{(time.perf_counter() - started_at) * 1000:.0f} ms"
         )
-        run_command(command, conversation_id, "voice", session_id)
     except Exception as error:
         print(f"Voice API error ({type(error).__name__}): {error}")
         emit(
             "error",
             status="error",
-            message="The microphone could not be used.",
+            message=microphone_failure_message(error),
             microphone=microphone_failure_status(error),
             correlation_id=session_id,
         )
     finally:
         with voice_lock:
-            voice_session_id = None
-            state["voice_conversation_id"] = None
+            state["voice_processing"] = False
+            if voice_session_id == session_id:
+                voice_session_id = None
+                voice_microphone = None
+                state["voice_conversation_id"] = None
         if state["status"] not in {"error", "idle"}:
             emit(
                 "listening_finished",
@@ -415,14 +534,17 @@ def stop_voice():
         voice_session_id = None
         stopper = voice_stopper
         voice_stopper = None
+        microphone = voice_microphone
     if stopper is not None:
-        emit(
-            "listening_stopping",
-            status="stopping",
-            message="Stopping listening...",
-            correlation_id=session_id,
-        )
         stopper(wait_for_stop=False)
+        if microphone is not None:
+            microphone.closed_event.wait(timeout=3)
+    emit(
+        "listening_stopping",
+        status="stopping",
+        message="Stopping listening...",
+        correlation_id=session_id,
+    )
     emit(
         "listening_stopped",
         status="idle",
@@ -436,12 +558,16 @@ def stop_voice():
 @app.websocket("/api/events")
 async def events(websocket: WebSocket):
     await websocket.accept()
+    loop = asyncio.get_running_loop()
     queue = asyncio.Queue(maxsize=20)
-    subscribers.add(queue)
+    subscriber = (loop, queue)
+    with subscriber_lock:
+        subscribers.add(subscriber)
     try:
         while True:
             await websocket.send_json(await queue.get())
     except WebSocketDisconnect:
         pass
     finally:
-        subscribers.discard(queue)
+        with subscriber_lock:
+            subscribers.discard(subscriber)

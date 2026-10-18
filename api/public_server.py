@@ -1,46 +1,64 @@
-"""Authenticated, text-only API for the NEXORA AI public demo.
+"""Authenticated, text-only API for the NEXORA AI public demo."""
 
-This module intentionally does not import main.py. It cannot access microphones,
-Windows processes, browser automation, local SQLite history, or text-to-speech.
-"""
-
-import json
 import os
-import urllib.error
-import urllib.request
-import uuid
+from pathlib import Path
+from datetime import timezone
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
-from services.public_postgres_store import PublicPostgresStore
-
-
-app = FastAPI(title="NEXORA AI Public Demo API")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        origin.strip()
-        for origin in os.getenv("PUBLIC_FRONTEND_ORIGINS", "").split(",")
-        if origin.strip()
-    ],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "PATCH", "DELETE"],
-    allow_headers=["Authorization", "Content-Type"],
+from services.auth import (
+    create_token,
+    normalize_email,
+    password_hash,
+    rate_limit_key,
+    validate_password,
+    verify_token,
 )
+from services.mongodb import lifespan, mongo
+from services.public_mongodb_store import PublicMongoStore
+
+
+configured_origins = [
+    origin.strip()
+    for origin in os.getenv("PUBLIC_FRONTEND_ORIGINS", "").split(",")
+    if origin.strip()
+]
+for local_origin in ("http://localhost:5173", "http://127.0.0.1:5173"):
+    if local_origin not in configured_origins:
+        configured_origins.append(local_origin)
 client = (
     Groq(api_key=os.environ["GROQ_API_KEY"], timeout=20, max_retries=0)
     if os.getenv("GROQ_API_KEY")
     else None
 )
-store = PublicPostgresStore(os.getenv("DATABASE_URL")) if os.getenv("DATABASE_URL") else None
+app = FastAPI(title="NEXORA AI Public Demo API", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=configured_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+
+class AuthRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
 
 
 class ChatRequest(BaseModel):
     conversation_id: str | None = None
     message: str = Field(min_length=1, max_length=4000)
+    input_type: str = Field(default="text", pattern="^(text|voice)$")
+    action_result: str | None = Field(default=None, max_length=1000)
+    follow_up_question: str | None = Field(default=None, max_length=4000)
 
 
 class ConversationRequest(BaseModel):
@@ -52,108 +70,238 @@ class RenameRequest(BaseModel):
 
 
 def require_store():
-    if store is None:
-        raise HTTPException(status_code=503, detail="Public history is not configured")
-    return store
+    if mongo.database is None:
+        raise HTTPException(status_code=503, detail="Database is not ready")
+    return PublicMongoStore(mongo.database)
 
 
-def current_user(request: Request):
-    authorization = request.headers.get("authorization", "")
-    if not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Authentication is required")
-    token = authorization[7:].strip()
-    supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
-    supabase_key = os.getenv("SUPABASE_ANON_KEY", "")
-    if not token or not supabase_url or not supabase_key:
-        raise HTTPException(status_code=503, detail="Public authentication is not configured")
-    request_data = urllib.request.Request(
-        f"{supabase_url}/auth/v1/user",
-        headers={"apikey": supabase_key, "Authorization": f"Bearer {token}"},
-    )
-    try:
-        with urllib.request.urlopen(request_data, timeout=5) as response:
-            user = json.load(response)
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
-        if isinstance(error, urllib.error.HTTPError) and error.code in {400, 401, 403}:
-            raise HTTPException(status_code=401, detail="Authentication is invalid") from error
-        raise HTTPException(status_code=503, detail="Authentication service is unavailable") from error
-    user_id = user.get("id")
-    if not user_id:
+def rate_window_elapsed(now, started_at):
+    # Treat legacy BSON datetimes decoded without tz_aware as UTC.
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    return (now - started_at).total_seconds()
+
+
+def database_unavailable():
+    return HTTPException(status_code=503, detail="Authentication service is temporarily unavailable")
+
+
+async def record_auth_attempt(repository, rate_key, now, limit):
+    collection = repository.database.auth_rate_limits
+    window = await collection.find_one({"_id": rate_key})
+    if window and rate_window_elapsed(now, window["window_started"]) < 900 and window["attempts"] >= limit:
+        raise HTTPException(status_code=429, detail="Too many authentication attempts; try again later")
+    if not window or rate_window_elapsed(now, window["window_started"]) >= 900:
+        await collection.replace_one(
+            {"_id": rate_key},
+            {"_id": rate_key, "attempts": 1, "window_started": now},
+            upsert=True,
+        )
+    else:
+        await collection.update_one({"_id": rate_key}, {"$inc": {"attempts": 1}})
+
+
+async def current_user(request: Request, repository=Depends(require_store)):
+    user_id = verify_token(request)
+    user = await repository.database.users.find_one({"_id": user_id}, {"email": 1})
+    if user is None:
         raise HTTPException(status_code=401, detail="Authentication is invalid")
-    return user_id
+    return {"id": user_id, "email": user["email"]}
 
 
-def conversation_or_404(repository, conversation_id, user_id):
-    conversation = repository.get_conversation(conversation_id, user_id)
+async def get_conversation_or_404(repository, conversation_id, user_id):
+    conversation = await repository.get_conversation(conversation_id, user_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return conversation
 
 
 @app.get("/api/health")
-def health():
-    return {"ok": True, "service": "nexora-public-demo", "history": store is not None}
+async def health():
+    return {
+        "ok": True,
+        "service": "nexora-public-demo",
+        "database": "ready" if mongo.database is not None else "not_ready",
+    }
+
+
+@app.get("/api/ready")
+async def ready():
+    if mongo.database is None:
+        raise HTTPException(status_code=503, detail="Database is not ready")
+    try:
+        await mongo.client.admin.command("ping")
+    except PyMongoError as error:
+        raise HTTPException(status_code=503, detail="Database is not ready") from error
+    return {"ok": True, "database": "ready"}
+
+
+@app.post("/api/auth/register")
+async def register(request: Request, payload: AuthRequest, response: Response, repository=Depends(require_store)):
+    email = normalize_email(payload.email)
+    validate_password(payload.password)
+    rate_key = rate_limit_key(request, email)
+    now = repository._now()
+    try:
+        await record_auth_attempt(repository, rate_key, now, 5)
+        existing = await repository.database.users.find_one({"email_normalized": email}, {"_id": 1})
+        if existing:
+            raise HTTPException(status_code=409, detail="An account with that email already exists")
+        user_id = str(__import__("uuid").uuid4())
+        await repository.database.users.insert_one({
+            "_id": user_id,
+            "email": email,
+            "email_normalized": email,
+            "password_hash": password_hash.hash(payload.password),
+            "created_at": now,
+        })
+    except DuplicateKeyError as error:
+        raise HTTPException(status_code=409, detail="An account with that email already exists") from error
+    except PyMongoError as error:
+        raise database_unavailable() from error
+    response.set_cookie(
+        "nexora_access_token",
+        create_token(user_id),
+        httponly=True,
+        secure=os.getenv("COOKIE_SECURE", "false").lower() == "true",
+        samesite=os.getenv("COOKIE_SAMESITE", "lax"),
+        max_age=1800,
+    )
+    return {"user": {"id": user_id, "email": email}}
+
+
+@app.post("/api/auth/login")
+async def login(request: Request, payload: AuthRequest, response: Response, repository=Depends(require_store)):
+    email = normalize_email(payload.email)
+    rate_key = rate_limit_key(request, email)
+    now = repository._now()
+    try:
+        await record_auth_attempt(repository, rate_key, now, 10)
+        user = await repository.database.users.find_one({"email_normalized": email})
+    except PyMongoError as error:
+        raise database_unavailable() from error
+    if user is None or not password_hash.verify(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    response.set_cookie(
+        "nexora_access_token",
+        create_token(user["_id"]),
+        httponly=True,
+        secure=os.getenv("COOKIE_SECURE", "false").lower() == "true",
+        samesite=os.getenv("COOKIE_SAMESITE", "lax"),
+        max_age=1800,
+    )
+    return {"user": {"id": user["_id"], "email": user["email"]}}
+
+
+@app.get("/api/auth/me")
+async def me(request: Request, repository=Depends(require_store)):
+    """Return the current session without treating a logged-out visitor as an error."""
+    try:
+        user_id = verify_token(request)
+    except HTTPException as error:
+        if error.status_code == 401:
+            return {"user": None}
+        raise
+    user = await repository.database.users.find_one({"_id": user_id}, {"email": 1})
+    if user is None:
+        return {"user": None}
+    return {"user": {"id": user_id, "email": user["email"]}}
+
+
+@app.get("/api/auth/session")
+async def session(request: Request):
+    """Check for a login cookie without returning 401 for logged-out visitors."""
+    try:
+        user_id = verify_token(request)
+    except HTTPException as error:
+        if error.status_code == 401:
+            return {"user": None}
+        raise
+    repository = require_store()
+    try:
+        user = await repository.database.users.find_one({"_id": user_id}, {"email": 1})
+    except PyMongoError as error:
+        raise database_unavailable() from error
+    if user is None:
+        return {"user": None}
+    return {"user": {"id": user_id, "email": user["email"]}}
+
+
+@app.post("/api/auth/logout")
+async def logout(response: Response):
+    response.delete_cookie("nexora_access_token")
+    return {"ok": True}
 
 
 @app.get("/api/status")
-def status():
+async def status():
     return {"status": "idle", "message": "Public text chat ready.", "microphone": "unavailable"}
 
 
 @app.get("/api/conversations")
-def list_conversations(search: str = "", user_id=Depends(current_user), repository=Depends(require_store)):
-    return repository.list_conversations(user_id, search)
+async def list_conversations(search: str = "", user=Depends(current_user), repository=Depends(require_store)):
+    return await repository.list_conversations(user["id"], search)
 
 
 @app.post("/api/conversations")
-def create_conversation(request: ConversationRequest, user_id=Depends(current_user), repository=Depends(require_store)):
-    return repository.create_conversation(str(uuid.uuid4()), user_id, request.title)
+async def create_conversation(payload: ConversationRequest, user=Depends(current_user), repository=Depends(require_store)):
+    return await repository.create_conversation(str(__import__("bson").ObjectId()), user["id"], payload.title)
 
 
 @app.get("/api/conversations/{conversation_id}")
-def get_conversation(conversation_id: str, user_id=Depends(current_user), repository=Depends(require_store)):
-    return conversation_or_404(repository, conversation_id, user_id)
+async def get_conversation(conversation_id: str, user=Depends(current_user), repository=Depends(require_store)):
+    return await get_conversation_or_404(repository, conversation_id, user["id"])
 
 
 @app.patch("/api/conversations/{conversation_id}")
-def rename_conversation(conversation_id: str, request: RenameRequest, user_id=Depends(current_user), repository=Depends(require_store)):
-    return_value = repository.rename(conversation_id, user_id, request.title)
-    if return_value is None:
+async def rename_conversation(conversation_id: str, payload: RenameRequest, user=Depends(current_user), repository=Depends(require_store)):
+    result = await repository.rename(conversation_id, user["id"], payload.title)
+    if result is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    return return_value
+    return result
 
 
 @app.delete("/api/conversations/{conversation_id}")
-def delete_conversation(conversation_id: str, user_id=Depends(current_user), repository=Depends(require_store)):
-    if not repository.delete(conversation_id, user_id):
+async def delete_conversation(conversation_id: str, user=Depends(current_user), repository=Depends(require_store)):
+    if not await repository.delete(conversation_id, user["id"]):
         raise HTTPException(status_code=404, detail="Conversation not found")
     return {"ok": True}
 
 
 @app.delete("/api/conversations")
-def clear_conversations(user_id=Depends(current_user), repository=Depends(require_store)):
-    repository.clear(user_id)
+async def clear_conversations(user=Depends(current_user), repository=Depends(require_store)):
+    await repository.clear(user["id"])
     return {"ok": True}
 
 
 @app.post("/api/chat")
-def chat(request: ChatRequest, user_id=Depends(current_user), repository=Depends(require_store)):
-    if client is None:
+async def chat(payload: ChatRequest, user=Depends(current_user), repository=Depends(require_store)):
+    action_only = bool(payload.action_result and not payload.follow_up_question)
+    if client is None and not action_only:
         raise HTTPException(status_code=503, detail="Public AI service is not configured")
-    conversation_id = request.conversation_id or str(uuid.uuid4())
-    if request.conversation_id is None:
-        repository.create_conversation(conversation_id, user_id)
+    conversation_id = payload.conversation_id or str(__import__("bson").ObjectId())
+    if payload.conversation_id is None:
+        await repository.create_conversation(conversation_id, user["id"])
     else:
-        conversation_or_404(repository, conversation_id, user_id)
-    repository.add_message(conversation_id, user_id, "user", request.message)
-    conversation = repository.get_conversation(conversation_id, user_id)
-    messages = [
-        {"role": message["role"], "content": message["content"]}
-        for message in conversation["messages"][-12:]
-    ]
+        await get_conversation_or_404(repository, conversation_id, user["id"])
+    await repository.add_message(conversation_id, user["id"], "user", payload.message, payload.input_type)
+    if payload.action_result and not payload.follow_up_question:
+        await repository.add_message(conversation_id, user["id"], "assistant", payload.action_result)
+        return {
+            "conversation_id": conversation_id,
+            "response": payload.action_result,
+            "conversation": await repository.get_conversation(conversation_id, user["id"]),
+        }
+    conversation = await repository.get_conversation(conversation_id, user["id"])
+    messages = [{"role": message["role"], "content": message["content"]} for message in conversation["messages"][-12:]]
+    if payload.action_result and payload.follow_up_question:
+        messages = messages[:-1] + [
+            {"role": "assistant", "content": f"The local computer action completed: {payload.action_result}"},
+            {"role": "user", "content": payload.follow_up_question},
+        ]
     try:
         completion = client.chat.completions.create(
-            model=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+            model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
             messages=messages,
             temperature=0.4,
             max_tokens=500,
@@ -163,9 +311,9 @@ def chat(request: ChatRequest, user_id=Depends(current_user), repository=Depends
         raise HTTPException(status_code=502, detail="The public AI service is temporarily unavailable") from error
     if not answer:
         raise HTTPException(status_code=502, detail="The public AI service returned an empty response")
-    repository.add_message(conversation_id, user_id, "assistant", answer)
+    await repository.add_message(conversation_id, user["id"], "assistant", answer)
     return {
         "conversation_id": conversation_id,
         "response": answer,
-        "conversation": repository.get_conversation(conversation_id, user_id),
+        "conversation": await repository.get_conversation(conversation_id, user["id"]),
     }

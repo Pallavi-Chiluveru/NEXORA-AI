@@ -10,12 +10,18 @@ services:
       - key: GROQ_API_KEY
         sync: false
       - key: GROQ_MODEL
-        value: llama-3.1-8b-instant
+        value: openai/gpt-oss-20b
       - key: PUBLIC_FRONTEND_ORIGINS
         sync: false
-      - key: DATABASE_URL
+      - key: MONGODB_URI
         sync: false
-      - key: SUPABASE_URL
+      - key: MONGODB_DATABASE
+        value: nexora
+      - key: JWT_SECRET_KEY
         sync: false
-      - key: SUPABASE_ANON_KEY
-        sync: false
+      - key: JWT_ACCESS_TOKEN_EXPIRE_MINUTES
+        value: "30"
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: COOKIE_SAMESITE
+        value: none

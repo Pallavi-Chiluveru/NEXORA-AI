@@ -14,6 +14,7 @@ import pyttsx3
 import speech_recognition as sr
 from dotenv import load_dotenv
 from groq import Groq
+from services.local_actions import classify_local_action
 
 
 if getattr(sys, "frozen", False):
@@ -103,7 +104,7 @@ def speak(text):
     """Speak text with a fresh engine so repeated responses remain audible."""
     cleaned_text = clean_for_speech(text)
     if not cleaned_text:
-        return
+        return False
 
     with speech_lock:
         engine = None
@@ -135,8 +136,10 @@ def speak(text):
             engine.say(cleaned_text)
             engine.runAndWait()
             engine.stop()
+            return True
         except Exception as error:
             print(f"Speech error ({type(error).__name__}): {error}")
+            return False
         finally:
             if engine is not None:
                 del engine
@@ -545,6 +548,9 @@ def browser_action(action, message, *args):
 
 def execute_command(command):
     """Route allow-listed local commands before using Groq as fallback."""
+    local_action = classify_local_action(command)
+    if local_action:
+        command = local_action["command"]
     raw_command = re.sub(r"\bjarvis\b", " ", command.lower()).strip()
     normalized = re.sub(r"[^\w\s]", " ", command.lower())
     normalized = re.sub(r"\bjarvis\b", " ", normalized)
@@ -583,9 +589,9 @@ def execute_command(command):
 
     # Website searches, websites, and applications take priority over conversation.
     search_match = None
-    if "youtube" not in normalized:
-        search_match = re.search(
-            r"(?:search google|google|search the web|search for|find)\s+(?:for\s+)?(.+)",
+    if not normalized.startswith(("search youtube", "search on youtube", "open youtube and search")):
+        search_match = re.match(
+            r"^(?:please\s+)?(?:search google|google|search the web|search for|find)\s+(?:for\s+)?(.+)",
             normalized,
         )
     if search_match:
@@ -598,8 +604,8 @@ def execute_command(command):
             respond("What would you like me to search for?")
         return True
 
-    youtube_match = re.search(
-        r"(?:search youtube for|search on youtube for|"
+    youtube_match = re.match(
+        r"^(?:search youtube for|search on youtube for|"
         r"open youtube and search for)\s+(.+)",
         normalized,
     )
@@ -639,16 +645,20 @@ def execute_command(command):
         return True
 
     website_command = next(
-        (website for website in WEBSITES if website in normalized),
+        (website for website in WEBSITES if website == normalized),
         None,
     )
     if website_command:
         url, success_message = WEBSITES[website_command]
         open_url(url, success_message)
+        if local_action and local_action["question"]:
+            answer = ask_ai(local_action["question"])
+            if answer:
+                respond(answer)
         return True
 
     application_command = next(
-        (application for application in LOCAL_APPLICATIONS if application in normalized),
+        (application for application in LOCAL_APPLICATIONS if application == normalized),
         None,
     )
     if application_command:
