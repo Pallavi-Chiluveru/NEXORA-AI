@@ -70,6 +70,10 @@ class AuthApiTests(unittest.TestCase):
 
         duplicate = self.client.post("/api/auth/register", json=payload)
         self.assertEqual(duplicate.status_code, 409, duplicate.text)
+        self.assertEqual(
+            duplicate.json()["detail"],
+            "An account with this email already exists. Please sign in.",
+        )
 
         # Exercise a prior Mongo rate-limit date decoded as naive UTC.
         valid_login = self.client.post("/api/auth/login", json=payload)

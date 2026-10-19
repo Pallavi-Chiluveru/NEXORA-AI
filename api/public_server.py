@@ -28,6 +28,7 @@ from services.public_mongodb_store import PublicMongoStore
 
 
 logger = logging.getLogger("nexora.auth")
+ACCOUNT_EXISTS_MESSAGE = "An account with this email already exists. Please sign in."
 
 
 def auth_subject(email):
@@ -161,7 +162,7 @@ async def register(request: Request, payload: AuthRequest, response: Response, r
         await record_auth_attempt(repository, rate_key, now, 5)
         existing = await repository.database.users.find_one({"email_normalized": email}, {"_id": 1})
         if existing:
-            raise HTTPException(status_code=409, detail="An account with that email already exists")
+            raise HTTPException(status_code=409, detail=ACCOUNT_EXISTS_MESSAGE)
         user_id = str(__import__("uuid").uuid4())
         await repository.database.users.insert_one({
             "_id": user_id,
@@ -171,7 +172,7 @@ async def register(request: Request, payload: AuthRequest, response: Response, r
             "created_at": now,
         })
     except DuplicateKeyError as error:
-        raise HTTPException(status_code=409, detail="An account with that email already exists") from error
+        raise HTTPException(status_code=409, detail=ACCOUNT_EXISTS_MESSAGE) from error
     except PyMongoError as error:
         raise database_unavailable() from error
     response.set_cookie(

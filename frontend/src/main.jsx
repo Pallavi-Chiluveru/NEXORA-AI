@@ -429,8 +429,11 @@ function AuthScreen({ onAuthenticated, theme, setTheme, notice = "" }) {
   const [message, setMessage] = useState(notice);
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
+  const submitInFlight = useRef(false);
   const submit = async (event) => {
     event.preventDefault();
+    if (submitInFlight.current) return;
+    submitInFlight.current = true;
     setMessage("");
     setLoading(true);
     try {
@@ -447,6 +450,7 @@ function AuthScreen({ onAuthenticated, theme, setTheme, notice = "" }) {
         ? "Email or password is incorrect. Check your details or create an account."
         : error.message || "Unable to sign in right now. Please try again.");
     } finally {
+      submitInFlight.current = false;
       setLoading(false);
     }
   };
