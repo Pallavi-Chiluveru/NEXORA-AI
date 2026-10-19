@@ -27,6 +27,10 @@ const API = import.meta.env.DEV
 const LOCAL_API = import.meta.env.DEV
   ? "/local-api"
   : withoutTrailingSlash(import.meta.env.VITE_LOCAL_API_BASE_URL || "http://127.0.0.1:8765/api");
+const localHostnames = new Set(["localhost", "127.0.0.1", "[::1]"]);
+const LOCAL_API_ENABLED = import.meta.env.DEV
+  || (localHostnames.has(window.location.hostname)
+    && import.meta.env.VITE_ENABLE_LOCAL_API === "true");
 const navItems = [
   ["home", "Home", Home], ["chat", "Chat", MessageSquare],
   ["voice", "Voice Control", Mic], ["apps", "Applications", AppWindow],
@@ -169,6 +173,10 @@ function App() {
   };
   const localUnavailableText = "Local computer control is unavailable. Start the NEXORA AI Windows assistant to use this feature.";
   const runAction = async (command) => {
+    if (!LOCAL_API_ENABLED) {
+      setToast("Local computer control is disabled for this deployment.");
+      return;
+    }
     try {
       const result = await requestLocal("/actions/execute", { method: "POST", body: JSON.stringify({ command }), timeout: 20000 });
       if (!result.ok) throw new Error(result.message || "The local action did not complete.");
@@ -178,6 +186,10 @@ function App() {
     }
   };
   const toggleVoice = useCallback(async () => {
+    if (!LOCAL_API_ENABLED) {
+      setToast("Microphone control is available in local development when the Windows assistant is running.");
+      return;
+    }
     const currentVoiceState = voiceInteractionState(status);
     if (currentVoiceState === "disconnected" || currentVoiceState === "connecting") {
       setToast("Connecting to the Windows assistant. Start it with run_local.bat and try again when Local control shows Ready.");
@@ -211,6 +223,10 @@ function App() {
     const action = localActionRequest(message);
     let actionResult = null;
     if (action) {
+      if (!LOCAL_API_ENABLED) {
+        setToast("Local computer control is disabled for this deployment.");
+        return;
+      }
       try {
         const localResult = await requestLocal("/actions/execute", { method: "POST", body: JSON.stringify({ command: action.command }), timeout: 20000 });
         if (!localResult.ok) throw new Error(localResult.message || "The local action did not complete.");
@@ -242,12 +258,27 @@ function App() {
   sendMessageRef.current = sendMessage;
   useEffect(() => {
     if (!session) return undefined;
-    request("/status").then((cloudStatus) => setStatus((current) => ({ ...current, ...cloudStatus, local_service: current.local_service }))).catch(() => setStatus((current) => ({ ...current, status: "error", message: "Cloud API unavailable" })));
-    loadConversations();
+    request("/auth/session")
+      .then((result) => {
+        if (!result.user) {
+          setSession(null);
+          setAuthNotice("Your login session was not saved. Please sign in again.");
+          return;
+        }
+        return Promise.all([
+          request("/status").then((cloudStatus) => setStatus((current) => ({ ...current, ...cloudStatus, local_service: current.local_service }))),
+          loadConversations(),
+        ]);
+      })
+      .catch(() => setStatus((current) => ({ ...current, status: "error", message: "Cloud API unavailable" })));
     return undefined;
   }, [session]);
   useEffect(() => {
     if (!session) return undefined;
+    if (!LOCAL_API_ENABLED) {
+      setStatus((current) => ({ ...current, local_service: "unavailable" }));
+      return undefined;
+    }
     let active = true;
     let socket;
     let retryTimer;
