@@ -124,7 +124,7 @@ function App() {
   const [session, setSession] = useState(null);
   const [page, setPage] = useState("home");
   const [theme, setTheme] = useState(() => localStorage.getItem("nexora-theme") || (window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark"));
-  const [status, setStatus] = useState({ status: "idle", message: "Click to Start Listening.", groq: "unknown", microphone: "not_checked", speech_engine: "unknown", local_service: "connecting" });
+  const [status, setStatus] = useState({ status: "idle", message: "Click to Start Listening.", groq: "unknown", microphone: "not_checked", speech_engine: "unknown", local_service: LOCAL_API_ENABLED ? "connecting" : "unavailable" });
   const [conversations, setConversations] = useState([]);
   const [selected, setSelected] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -135,6 +135,7 @@ function App() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const sendMessageRef = useRef(null);
   const voiceChatInFlight = useRef(false);
+  const validatedSessionRef = useRef(null);
 
   useEffect(() => { localStorage.setItem("nexora-theme", theme); }, [theme]);
 
@@ -257,22 +258,32 @@ function App() {
   };
   sendMessageRef.current = sendMessage;
   useEffect(() => {
-    if (!session) return undefined;
+    if (!session) {
+      validatedSessionRef.current = null;
+      return undefined;
+    }
+    const sessionId = session.id;
+    const loadAuthenticatedData = () => Promise.all([
+      request("/status").then((cloudStatus) => setStatus((current) => ({ ...current, ...cloudStatus, local_service: current.local_service }))),
+      loadConversations(historySearch),
+    ]);
+    if (validatedSessionRef.current === sessionId) {
+      loadAuthenticatedData().catch((error) => setToast(error.message));
+      return undefined;
+    }
     request("/auth/session")
       .then((result) => {
-        if (!result.user) {
+        if (!result.user || result.user.id !== sessionId) {
           setSession(null);
           setAuthNotice("Your login session was not saved. Please sign in again.");
           return;
         }
-        return Promise.all([
-          request("/status").then((cloudStatus) => setStatus((current) => ({ ...current, ...cloudStatus, local_service: current.local_service }))),
-          loadConversations(),
-        ]);
+        validatedSessionRef.current = sessionId;
+        return loadAuthenticatedData();
       })
       .catch(() => setStatus((current) => ({ ...current, status: "error", message: "Cloud API unavailable" })));
     return undefined;
-  }, [session]);
+  }, [session, historySearch]);
   useEffect(() => {
     if (!session) return undefined;
     if (!LOCAL_API_ENABLED) {
@@ -354,11 +365,6 @@ function App() {
       socket?.close();
     };
   }, [session]);
-  useEffect(() => {
-    if (!session) return undefined;
-    const timer = setTimeout(() => loadConversations(historySearch), 250);
-    return () => clearTimeout(timer);
-  }, [historySearch, session]);
   useEffect(() => {
     const handler = (event) => {
       const target = document.activeElement;
