@@ -29,10 +29,17 @@ from services.public_mongodb_store import PublicMongoStore
 
 logger = logging.getLogger("nexora.auth")
 ACCOUNT_EXISTS_MESSAGE = "An account with this email already exists. Please sign in."
+PRODUCTION_FRONTEND_ORIGIN = "https://nexora-ai-two-smoky.vercel.app"
 
 
 def auth_subject(email):
     return hashlib.sha256(email.encode("utf-8")).hexdigest()[:12]
+
+
+def cookie_options(request):
+    if request.headers.get("origin", "").rstrip("/") == PRODUCTION_FRONTEND_ORIGIN:
+        return {"secure": True, "samesite": "none"}
+    return {"secure": cookie_secure, "samesite": cookie_samesite}
 
 
 configured_origins = [
@@ -179,8 +186,7 @@ async def register(request: Request, payload: AuthRequest, response: Response, r
         "nexora_access_token",
         create_token(user_id),
         httponly=True,
-        secure=cookie_secure,
-        samesite=cookie_samesite,
+        **cookie_options(request),
         max_age=1800,
     )
     return {"user": {"id": user_id, "email": email}}
@@ -215,8 +221,7 @@ async def login(request: Request, payload: AuthRequest, response: Response, repo
         "nexora_access_token",
         create_token(user["_id"]),
         httponly=True,
-        secure=cookie_secure,
-        samesite=cookie_samesite,
+        **cookie_options(request),
         max_age=1800,
     )
     return {"user": {"id": user["_id"], "email": user["email"]}}
@@ -257,8 +262,8 @@ async def session(request: Request):
 
 
 @app.post("/api/auth/logout")
-async def logout(response: Response):
-    response.delete_cookie("nexora_access_token")
+async def logout(request: Request, response: Response):
+    response.delete_cookie("nexora_access_token", **cookie_options(request))
     return {"ok": True}
 
 

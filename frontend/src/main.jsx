@@ -444,7 +444,11 @@ function AuthScreen({ onAuthenticated, theme, setTheme, notice = "" }) {
         body: JSON.stringify({ email: email.trim(), password }),
       });
       if (!result?.user) throw new Error("The server did not return an account. Please try again.");
-      onAuthenticated(result.user);
+      const session = await request("/auth/session");
+      if (!session?.user || session.user.id !== result.user.id) {
+        throw new Error("Your login session was not saved. Please sign in again.");
+      }
+      onAuthenticated(session.user);
     } catch (error) {
       setMessage(error.status === 401
         ? "Email or password is incorrect. Check your details or create an account."

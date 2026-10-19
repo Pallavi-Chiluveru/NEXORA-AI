@@ -75,6 +75,18 @@ class AuthApiTests(unittest.TestCase):
             "An account with this email already exists. Please sign in.",
         )
 
+        production_login = self.client.post(
+            "/api/auth/login",
+            json=payload,
+            headers={"Origin": "https://nexora-ai-two-smoky.vercel.app"},
+        )
+        self.assertEqual(production_login.status_code, 200, production_login.text)
+        self.assertIn(
+            "SameSite=none",
+            production_login.headers["set-cookie"],
+        )
+        self.assertIn("Secure", production_login.headers["set-cookie"])
+
         # Exercise a prior Mongo rate-limit date decoded as naive UTC.
         valid_login = self.client.post("/api/auth/login", json=payload)
         self.assertEqual(valid_login.status_code, 200, valid_login.text)
