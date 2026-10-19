@@ -155,5 +155,16 @@ class AuthApiTests(unittest.TestCase):
             "Content-Type", response.headers["access-control-allow-headers"]
         )
 
+    def test_production_origin_is_preserved_when_environment_has_other_origins(self):
+        cors_middleware = next(
+            middleware
+            for middleware in public_server.app.user_middleware
+            if middleware.cls.__name__ == "CORSMiddleware"
+        )
+        self.assertIn(
+            "https://nexora-ai-two-smoky.vercel.app",
+            cors_middleware.kwargs["allow_origins"],
+        )
+
 if __name__ == "__main__":
     unittest.main()

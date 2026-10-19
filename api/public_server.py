@@ -27,15 +27,16 @@ from services.public_mongodb_store import PublicMongoStore
 
 configured_origins = [
     origin.strip().rstrip("/")
-    for origin in os.getenv(
-        "PUBLIC_FRONTEND_ORIGINS",
-        "https://nexora-ai-two-smoky.vercel.app",
-    ).split(",")
+    for origin in os.getenv("PUBLIC_FRONTEND_ORIGINS", "").split(",")
     if origin.strip()
 ]
-for local_origin in ("http://localhost:5173", "http://127.0.0.1:5173"):
-    if local_origin not in configured_origins:
-        configured_origins.append(local_origin)
+for required_origin in (
+    "https://nexora-ai-two-smoky.vercel.app",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+):
+    if required_origin not in configured_origins:
+        configured_origins.append(required_origin)
 client = (
     Groq(api_key=os.environ["GROQ_API_KEY"], timeout=20, max_retries=0)
     if os.getenv("GROQ_API_KEY")
