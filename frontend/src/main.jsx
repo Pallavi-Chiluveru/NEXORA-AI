@@ -11,6 +11,13 @@ import {
 } from "lucide-react";
 import "./styles.css";
 import { localActionRequest } from "./localActions.js";
+import {
+  cancelSpeech,
+  createSpeechRecognition,
+  speechRecognitionConstructor,
+  speechSynthesisSupported,
+  speakText,
+} from "./voice.js";
 
 // Use Vite's same-origin proxy during local development to keep auth cookies
 // first-party and avoid browser CORS. Production builds use the configured API.
@@ -51,6 +58,8 @@ function microphoneLabel(value) {
     available: "Available",
     listening: "Listening",
     permission_denied: "Permission denied",
+    permission_needed: "Permission needed",
+    unavailable: "Unavailable",
     device_unavailable: "Device unavailable",
     error: "Error",
   }[value] || "Not checked";
@@ -133,9 +142,11 @@ function App() {
   const [authNotice, setAuthNotice] = useState("");
   const [loggingOut, setLoggingOut] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [speechEnabled, setSpeechEnabled] = useState(false);
   const sendMessageRef = useRef(null);
   const voiceChatInFlight = useRef(false);
   const validatedSessionRef = useRef(null);
+  const browserRecognitionRef = useRef(null);
 
   useEffect(() => { localStorage.setItem("nexora-theme", theme); }, [theme]);
 
@@ -173,6 +184,41 @@ function App() {
     catch (error) { setToast(error.message); }
   };
   const localUnavailableText = "Local computer control is unavailable. Start the NEXORA AI Windows assistant to use this feature.";
+  const browserSpeechAvailable = speechSynthesisSupported();
+  const browserRecognitionAvailable = Boolean(speechRecognitionConstructor());
+  const updateSpeechState = (speechState) => {
+    setStatus((current) => ({
+      ...current,
+      speech_engine: speechState === "speaking" ? "Speaking"
+        : speechState === "error" ? "Error"
+          : speechState === "unavailable" ? "Unavailable" : "Ready",
+      status: speechState === "speaking" ? "speaking" : current.status,
+    }));
+  };
+  const speak = useCallback((text) => {
+    if (!browserSpeechAvailable) {
+      setToast("Speech synthesis is unavailable in this browser.");
+      updateSpeechState("unavailable");
+      return false;
+    }
+    return speakText(text, updateSpeechState);
+  }, [browserSpeechAvailable]);
+  const toggleSpeech = () => {
+    if (!browserSpeechAvailable) {
+      setToast("Speech synthesis is unavailable in this browser.");
+      updateSpeechState("unavailable");
+      return;
+    }
+    if (speechEnabled) {
+      cancelSpeech();
+      setSpeechEnabled(false);
+      updateSpeechState("ready");
+      return;
+    }
+    setSpeechEnabled(true);
+    updateSpeechState("ready");
+    setToast("Spoken responses enabled.");
+  };
   const runAction = async (command) => {
     if (!LOCAL_API_ENABLED) {
       setToast("Local computer control is disabled for this deployment.");
@@ -188,7 +234,49 @@ function App() {
   };
   const toggleVoice = useCallback(async () => {
     if (!LOCAL_API_ENABLED) {
-      setToast("Microphone control is available in local development when the Windows assistant is running.");
+      if (!browserRecognitionAvailable) {
+        setToast("Browser microphone recognition is unavailable. Use Chrome or Edge over HTTPS.");
+        setStatus((current) => ({ ...current, microphone: "unavailable", status: "error", message: "Microphone recognition unavailable." }));
+        return;
+      }
+      if (status.status === "listening") {
+        browserRecognitionRef.current?.stop();
+        return;
+      }
+      setStatus((current) => ({ ...current, status: "starting", microphone: "permission_needed", message: "Requesting microphone permission..." }));
+      const recognition = createSpeechRecognition(
+        (transcript, isFinal) => {
+          if (transcript) setStatus((current) => ({ ...current, last_transcript: transcript, microphone: isFinal ? "available" : "listening" }));
+          if (isFinal && transcript) {
+            browserRecognitionRef.current?.stop();
+            setStatus((current) => ({ ...current, status: "processing", microphone: "available", message: "Sending your voice request..." }));
+            Promise.resolve(sendMessageRef.current?.(transcript, "voice"))
+              .catch((error) => setToast(error.message || "The voice request could not be completed."))
+              .finally(() => setStatus((current) => ({ ...current, status: "idle", message: "Click to Start Listening." })));
+          }
+        },
+        (error) => {
+          const message = error === "not-allowed"
+            ? "Microphone permission was denied. Allow microphone access in your browser settings."
+            : `Browser microphone error: ${error}.`;
+          setStatus((current) => ({ ...current, status: "error", microphone: error === "not-allowed" ? "permission_denied" : "error", message }));
+          setToast(message);
+        },
+        () => {
+          browserRecognitionRef.current = null;
+          setStatus((current) => current.status === "listening" || current.status === "starting"
+            ? { ...current, status: "idle", microphone: "available", message: "Click to Start Listening." } : current);
+        },
+      );
+      if (!recognition) return;
+      browserRecognitionRef.current = recognition;
+      try {
+        recognition.start();
+        setStatus((current) => ({ ...current, status: "listening", microphone: "listening", message: "Listening... Speak now..." }));
+      } catch {
+        browserRecognitionRef.current = null;
+        setStatus((current) => ({ ...current, status: "error", microphone: "error", message: "The browser microphone could not be started." }));
+      }
       return;
     }
     const currentVoiceState = voiceInteractionState(status);
@@ -246,13 +334,8 @@ function App() {
       }
       const result = await request("/chat", { method: "POST", body: JSON.stringify(payload) });
       setMessages(result.conversation.messages); loadConversations();
-      if (inputType === "voice" && (!actionResult || action?.question)) {
-        setStatus((current) => ({ ...current, status: "speaking", message: "NEXORA AI is speaking..." }));
-        try {
-          await requestLocal("/speech/speak", { method: "POST", body: JSON.stringify({ text: result.response }), timeout: 20000 });
-        } catch {
-          setToast("Your answer is ready, but local speech output is unavailable.");
-        }
+      if (speechEnabled && result.response) {
+        speak(result.response);
       }
     } catch (error) { setToast(error.message); }
   };
@@ -284,6 +367,10 @@ function App() {
       .catch(() => setStatus((current) => ({ ...current, status: "error", message: "Cloud API unavailable" })));
     return undefined;
   }, [session, historySearch]);
+  useEffect(() => () => {
+    browserRecognitionRef.current?.stop();
+    cancelSpeech();
+  }, []);
   useEffect(() => {
     if (!session) return undefined;
     if (!LOCAL_API_ENABLED) {
@@ -406,11 +493,11 @@ function App() {
       setLoggingOut(false);
     }
   };
-  return <div className={`app ${theme}`}><Sidebar theme={theme} page={page} nav={nav} conversations={conversations} search={historySearch} setSearch={setHistorySearch} selected={selected} select={selectConversation} newChat={newChat} mobileOpen={mobileOpen} status={status} onLogout={logout} loggingOut={loggingOut} />
+  return <div className={`app ${theme}`}><Sidebar theme={theme} page={page} nav={nav} conversations={conversations} search={historySearch} setSearch={setHistorySearch} selected={selected} select={selectConversation} newChat={newChat} mobileOpen={mobileOpen} status={status} onLogout={logout} loggingOut={loggingOut} speechEnabled={speechEnabled} toggleSpeech={toggleSpeech} />
     <main className="workspace">
       <header className="topbar"><button className="icon-button mobile-menu" onClick={() => setMobileOpen(true)}><Menu size={18} /></button><div className={`status-dot ${voiceInteractionState(status)}`} /><span>{status.local_service === "disconnected" ? "Windows assistant is offline. Run run_local.bat." : status.local_service === "connecting" ? "Connecting to local Windows assistant..." : status.message}</span><div className="top-actions"><button className="icon-button" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} title="Toggle theme">{theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}</button><span className="live-label">LOCAL / {voiceInteractionState(status).toUpperCase()}</span></div></header>
       <div className="content">{page === "home" && <HomePage status={status} activity={[]} runAction={runAction} toggleVoice={toggleVoice} nav={nav} />}
-        {page === "chat" && <ChatPage messages={messages} send={sendMessage} status={status} toggleVoice={toggleVoice} />}
+        {page === "chat" && <ChatPage messages={messages} send={sendMessage} status={status} toggleVoice={toggleVoice} speak={speak} />}
         {page === "voice" && <VoicePage status={status} toggleVoice={toggleVoice} />}
         {page === "apps" && <AppsPage runAction={runAction} />}
         {page === "browser" && <BrowserPage runAction={runAction} />}
@@ -566,7 +653,7 @@ function AuthScreen({ onAuthenticated, theme, setTheme, notice = "" }) {
   </main>;
 }
 
-function Sidebar({ theme, page, nav, conversations, search, setSearch, selected, select, newChat, mobileOpen, status, onLogout, loggingOut }) {
+function Sidebar({ theme, page, nav, conversations, search, setSearch, selected, select, newChat, mobileOpen, status, onLogout, loggingOut, speechEnabled, toggleSpeech }) {
   const brandImage = theme === "light" ? "/lightmode.png" : "/darkmode.png";
   return <aside className={`sidebar ${mobileOpen ? "open" : ""}`}><div className="brand"><img src={brandImage} alt="NEXORA AI — Your Intelligent Companion" className="brand-art" /></div>
     <div className="nav">{navItems.map(([id, label, Icon]) => <button key={id} className={page === id ? "active" : ""} onClick={() => nav(id)}><Icon size={17} />{label}</button>)}</div>
@@ -574,7 +661,7 @@ function Sidebar({ theme, page, nav, conversations, search, setSearch, selected,
     <button className="new-chat" onClick={newChat}><Plus size={16} /> New Chat</button>
     <div className="history-search"><Search size={14} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search chats" /></div>
     <div className="history-list">{conversations.length ? conversations.slice(0, 8).map((conversation) => <button className={`history-item ${selected === conversation.id ? "selected" : ""}`} onClick={() => select(conversation.id)} key={conversation.id}><MessageSquare size={14} /><span>{conversation.title}</span></button>) : <p className="empty-history">Your conversations will appear here.</p>}</div>
-    <div className="system-card"><div className="system-title"><span className={`status-dot ${voiceInteractionState(status)}`} /> System status</div><StatusRow label="NEXORA" value={status.status === "error" ? "Attention" : "Online"} /><StatusRow label="Local control" value={localServiceLabel(status.local_service)} /><StatusRow label="Microphone" value={microphoneLabel(status.microphone)} /><StatusRow label="Groq AI" value={status.groq || "Unknown"} /><StatusRow label="Speech engine" value={status.speech_engine || "Unknown"} /></div>
+    <div className="system-card"><div className="system-title"><span className={`status-dot ${voiceInteractionState(status)}`} /> System status</div><StatusRow label="NEXORA" value={status.status === "error" ? "Attention" : "Online"} /><StatusRow label="Local control" value={localServiceLabel(status.local_service)} /><StatusRow label="Microphone" value={microphoneLabel(status.microphone)} /><StatusRow label="Groq AI" value={status.groq || "Unknown"} /><StatusRow label="Speech engine" value={status.speech_engine || "Unknown"} /><button className="speech-toggle" type="button" onClick={toggleSpeech}>{speechEnabled ? "Disable spoken replies" : "Enable spoken replies"}</button></div>
     <button className="sidebar-logout" type="button" onClick={onLogout} disabled={loggingOut} aria-busy={loggingOut}><LogOut size={17} />{loggingOut ? "Signing out..." : "Logout"}</button>
   </aside>;
 }
@@ -619,9 +706,9 @@ function normalizeCompactMarkdown(content) {
   }).join("");
 }
 
-function ChatPage({ messages, send, status, toggleVoice }) {
+function ChatPage({ messages, send, status, toggleVoice, speak }) {
   const [input, setInput] = useState("");
-  return <><PageIntro eyebrow="CONVERSATION" title="Chat with NEXORA AI" description="Questions use cloud AI and MongoDB history. Voice and computer actions run on this Windows PC." /><section className="chat-panel"><div className="messages">{messages.length ? messages.map((message, index) => <div className={`message ${message.role}`} key={message.id || index}><span className="message-avatar">{message.role === "user" ? "YOU" : "N"}</span><div className="message-content"><small>{message.role === "user" ? "You" : "NEXORA AI"}</small>{message.role === "user" ? <p className="message-text">{message.content}</p> : <div className="message-body markdown-body"><ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{normalizeCompactMarkdown(message.content)}</ReactMarkdown></div>}{message.created_at && <time className="message-time" dateTime={message.created_at}>{new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>}</div></div>) : <div className="chat-empty"><Bot size={36} /><h3>Start a conversation</h3><p>Your conversations are saved to your private account.</p></div>}</div><form className="chat-input" onSubmit={(event) => { event.preventDefault(); const message = input.trim(); if (!message) return; send(message); setInput(""); }}><input value={input} onChange={(event) => setInput(event.target.value)} placeholder="Ask NEXORA AI anything..." /><button className="icon-button" type="button" onClick={toggleVoice} title={status.status === "listening" ? "Stop microphone" : "Start microphone"} aria-label={status.status === "listening" ? "Stop microphone" : "Start microphone"}><Mic size={18} /></button><button className="primary-button" type="submit" aria-label="Send message"><Send size={16} /></button></form></section></>;
+  return <><PageIntro eyebrow="CONVERSATION" title="Chat with NEXORA AI" description="Questions use cloud AI and MongoDB history. Voice and computer actions run on this Windows PC." /><section className="chat-panel"><div className="messages">{messages.length ? messages.map((message, index) => <div className={`message ${message.role}`} key={message.id || index}><span className="message-avatar">{message.role === "user" ? "YOU" : "N"}</span><div className="message-content"><small>{message.role === "user" ? "You" : "NEXORA AI"}</small>{message.role === "user" ? <p className="message-text">{message.content}</p> : <><div className="message-body markdown-body"><ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{normalizeCompactMarkdown(message.content)}</ReactMarkdown></div><button className="speak-message" type="button" onClick={() => speak(message.content)} title={speechEnabled ? "Play response" : "Enable speech in the system status panel first"} aria-label="Play response">Speaker</button></>}{message.created_at && <time className="message-time" dateTime={message.created_at}>{new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>}</div></div>) : <div className="chat-empty"><Bot size={36} /><h3>Start a conversation</h3><p>Your conversations are saved to your private account.</p></div>}</div><form className="chat-input" onSubmit={(event) => { event.preventDefault(); const message = input.trim(); if (!message) return; send(message); setInput(""); }}><input value={input} onChange={(event) => setInput(event.target.value)} placeholder="Ask NEXORA AI anything..." /><button className="icon-button" type="button" onClick={toggleVoice} title={status.status === "listening" ? "Stop microphone" : "Start microphone"} aria-label={status.status === "listening" ? "Stop microphone" : "Start microphone"}><Mic size={18} /></button><button className="primary-button" type="submit" aria-label="Send message"><Send size={16} /></button></form></section></>;
 }
 function VoicePage({ status, toggleVoice }) { const state = voiceInteractionState(status); const active = state === "listening"; const [title, subtitle] = voiceCopy(status); return <><PageIntro eyebrow="VOICE CONTROL" title="Speak naturally." description="The Python engine owns microphone capture, transcription, command execution, and speech synthesis." /><section className={`voice-panel voice-state-${state}`}><Orb status={state} onClick={toggleVoice} /><h2>{title}</h2><p className="muted">{subtitle}</p>{state === "processing" && <span className="loading-indicator" aria-label="Processing" />}{active && <button className="stop-button" onClick={toggleVoice}>Stop Listening</button>}<div className="transcript"><span>Latest transcript</span><strong>{status.last_transcript || "Waiting for a voice command..."}</strong></div></section></>; }
 function AppsPage({ runAction }) { return <><PageIntro eyebrow="APPLICATIONS" title="Desktop control" description="Only allowlisted Windows applications can be launched." /><ShortcutGrid runAction={runAction} /></>; }

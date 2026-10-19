@@ -409,6 +409,16 @@ public API on port 8002, MongoDB readiness at `/api/ready`, and Groq
 configuration. Local action requests are allowlisted; arbitrary shell and
 Python execution are not supported.
 
+For deployed browser voice, open the system status panel and choose
+**Enable spoken replies** after signing in. Ask a typed question to hear the
+new response, or use the speaker button on an assistant message. The browser
+must support `speechSynthesis`; autoplay restrictions are handled by requiring
+this user action first. The microphone button uses `SpeechRecognition` or
+`webkitSpeechRecognition` when available over HTTPS. Chrome and Edge are the
+recommended browsers; microphone permission must be granted. If browser
+recognition is unavailable, the button reports that limitation rather than
+pretending the local Windows microphone is online.
+
 Run the mock-safe regression checks from the repository root with
 `.\.venv\Scripts\python.exe -m unittest discover -s tests -v`, and run the
 frontend routing checks with `cd frontend; npm test`. The frontend production
@@ -424,7 +434,10 @@ The public demo is deliberately text-only. Use `api.public_server:app` for a
 cloud deployment; it does not import `main.py` and therefore does not load
 PyAudio, Windows process controls, browser automation, local SQLite history, or
 `pyttsx3`. It cannot execute operating-system commands or claim to speak
-through a visitor's speakers.
+through a visitor's speakers. The dashboard uses browser Web Speech APIs for
+optional microphone recognition and spoken cloud replies when the browser
+supports them. These browser features are independent of the optional local
+Windows assistant.
 
 ### Render backend
 

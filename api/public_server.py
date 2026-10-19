@@ -269,7 +269,14 @@ async def logout(request: Request, response: Response):
 
 @app.get("/api/status")
 async def status():
-    return {"status": "idle", "message": "Public text chat ready.", "microphone": "unavailable"}
+    return {
+        "status": "idle",
+        "message": "Public text chat ready.",
+        "microphone": "unavailable",
+        "groq": "ready" if client is not None else "unavailable",
+        "speech_engine": "browser",
+        "local_service": "unavailable",
+    }
 
 
 @app.get("/api/conversations")
