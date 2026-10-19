@@ -90,6 +90,23 @@ class AuthApiTests(unittest.TestCase):
         invalid = self.client.post("/api/auth/login", json={"email": "person@example.com", "password": "wrong-password"})
         self.assertEqual(invalid.status_code, 401)
 
+    def test_malformed_password_record_is_not_reported_as_invalid_credentials(self):
+        self.database.users.documents["person@example.com"] = {
+            "_id": "user-id",
+            "email": "person@example.com",
+            "email_normalized": "person@example.com",
+            "password_hash": None,
+        }
+        with patch.object(public_server, "logger") as logger:
+            response = self.client.post(
+                "/api/auth/login",
+                json={"email": "person@example.com", "password": "correct-horse-battery"},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Authentication service is temporarily unavailable")
+        logger.error.assert_called_once()
+
     def test_logout_clears_cookie_and_allows_signing_in_again(self):
         payload = {"email": "person@example.com", "password": "correct-horse-battery"}
         self.assertEqual(self.client.post("/api/auth/register", json=payload).status_code, 200)

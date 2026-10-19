@@ -1,5 +1,7 @@
 """Authenticated, text-only API for the NEXORA AI public demo."""
 
+import hashlib
+import logging
 import os
 from pathlib import Path
 from datetime import timezone
@@ -23,6 +25,13 @@ from services.auth import (
 )
 from services.mongodb import lifespan, mongo
 from services.public_mongodb_store import PublicMongoStore
+
+
+logger = logging.getLogger("nexora.auth")
+
+
+def auth_subject(email):
+    return hashlib.sha256(email.encode("utf-8")).hexdigest()[:12]
 
 
 configured_origins = [
@@ -185,8 +194,21 @@ async def login(request: Request, payload: AuthRequest, response: Response, repo
         await record_auth_attempt(repository, rate_key, now, 10)
         user = await repository.database.users.find_one({"email_normalized": email})
     except PyMongoError as error:
+        logger.exception("Authentication database lookup failed")
         raise database_unavailable() from error
-    if user is None or not password_hash.verify(payload.password, user["password_hash"]):
+    if user is None:
+        logger.info("Authentication failed: user_not_found subject=%s", auth_subject(email))
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    try:
+        password_valid = password_hash.verify(payload.password, user["password_hash"])
+    except (KeyError, TypeError, ValueError):
+        logger.error(
+            "Authentication failed: malformed_password_record subject=%s",
+            auth_subject(email),
+        )
+        raise database_unavailable()
+    if not password_valid:
+        logger.info("Authentication failed: password_mismatch subject=%s", auth_subject(email))
         raise HTTPException(status_code=401, detail="Invalid email or password")
     response.set_cookie(
         "nexora_access_token",
