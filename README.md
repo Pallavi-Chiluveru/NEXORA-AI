@@ -442,7 +442,7 @@ Set these environment variables in Render:
 ```text
 GROQ_API_KEY=your_server_side_key
 GROQ_MODEL=openai/gpt-oss-20b
-PUBLIC_FRONTEND_ORIGINS=https://your-project.vercel.app
+PUBLIC_FRONTEND_ORIGINS=https://nexora-ai-two-smoky.vercel.app
 MONGODB_URI=mongodb+srv://username:password@cluster.mongodb.net/?retryWrites=true&w=majority
 MONGODB_DATABASE=nexora
 JWT_SECRET_KEY=your_long_random_secret

@@ -15,9 +15,15 @@ import { localActionRequest } from "./localActions.js";
 // Use Vite's same-origin proxy during local development to keep auth cookies
 // first-party and avoid browser CORS. Production builds use the configured API.
 const withoutTrailingSlash = (value) => value.replace(/\/+$/, "");
+const cloudApiBase = (value) => {
+  const normalized = withoutTrailingSlash(value);
+  return normalized === "/api" || normalized.endsWith("/api")
+    ? normalized
+    : `${normalized}/api`;
+};
 const API = import.meta.env.DEV
   ? "/api"
-  : withoutTrailingSlash(import.meta.env.VITE_API_BASE_URL || "/api");
+  : cloudApiBase(import.meta.env.VITE_API_BASE_URL || "/api");
 const LOCAL_API = import.meta.env.DEV
   ? "/local-api"
   : withoutTrailingSlash(import.meta.env.VITE_LOCAL_API_BASE_URL || "http://127.0.0.1:8765/api");

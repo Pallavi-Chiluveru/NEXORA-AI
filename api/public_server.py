@@ -27,7 +27,10 @@ from services.public_mongodb_store import PublicMongoStore
 
 configured_origins = [
     origin.strip().rstrip("/")
-    for origin in os.getenv("PUBLIC_FRONTEND_ORIGINS", "").split(",")
+    for origin in os.getenv(
+        "PUBLIC_FRONTEND_ORIGINS",
+        "https://nexora-ai-two-smoky.vercel.app",
+    ).split(",")
     if origin.strip()
 ]
 for local_origin in ("http://localhost:5173", "http://127.0.0.1:5173"):
