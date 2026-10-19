@@ -26,7 +26,7 @@ from services.public_mongodb_store import PublicMongoStore
 
 
 configured_origins = [
-    origin.strip()
+    origin.strip().rstrip("/")
     for origin in os.getenv("PUBLIC_FRONTEND_ORIGINS", "").split(",")
     if origin.strip()
 ]
@@ -38,6 +38,8 @@ client = (
     if os.getenv("GROQ_API_KEY")
     else None
 )
+cookie_secure = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+cookie_samesite = os.getenv("COOKIE_SAMESITE", "lax").lower()
 app = FastAPI(title="NEXORA AI Public Demo API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
@@ -163,8 +165,8 @@ async def register(request: Request, payload: AuthRequest, response: Response, r
         "nexora_access_token",
         create_token(user_id),
         httponly=True,
-        secure=os.getenv("COOKIE_SECURE", "false").lower() == "true",
-        samesite=os.getenv("COOKIE_SAMESITE", "lax"),
+        secure=cookie_secure,
+        samesite=cookie_samesite,
         max_age=1800,
     )
     return {"user": {"id": user_id, "email": email}}
@@ -186,8 +188,8 @@ async def login(request: Request, payload: AuthRequest, response: Response, repo
         "nexora_access_token",
         create_token(user["_id"]),
         httponly=True,
-        secure=os.getenv("COOKIE_SECURE", "false").lower() == "true",
-        samesite=os.getenv("COOKIE_SAMESITE", "lax"),
+        secure=cookie_secure,
+        samesite=cookie_samesite,
         max_age=1800,
     )
     return {"user": {"id": user["_id"], "email": user["email"]}}

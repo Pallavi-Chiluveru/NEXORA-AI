@@ -82,6 +82,9 @@ conversation_history = [{"role": "system", "content": SYSTEM_MESSAGE}]
 # Shared speech-recognition settings.
 recognizer = sr.Recognizer()
 recognizer.dynamic_energy_threshold = True
+recognizer.energy_threshold = 300
+recognizer.dynamic_energy_adjustment_damping = 0.15
+recognizer.dynamic_energy_ratio = 1.5
 recognizer.pause_threshold = 1.8
 recognizer.non_speaking_duration = 0.8
 recognizer.phrase_threshold = 0.2
@@ -222,7 +225,11 @@ def ask_ai(question):
 def prepare_microphone():
     """Calibrate ambient noise once when NEXORA AI starts."""
     print("Preparing microphone...")
-    with sr.Microphone() as source:
+    device_index = os.getenv("MICROPHONE_DEVICE_INDEX", "").strip()
+    microphone = sr.Microphone(
+        device_index=int(device_index) if device_index else None
+    )
+    with microphone as source:
         recognizer.adjust_for_ambient_noise(source, duration=1)
     print("Microphone ready.")
 
@@ -454,7 +461,7 @@ browser_controller = BrowserController()
 
 
 def open_url(url, success_message):
-    """Open a validated URL, preferring the managed browser when available."""
+    """Open a validated URL with the user's browser and safe fallbacks."""
     parsed_url = urlparse(url) if isinstance(url, str) else None
     if (
         parsed_url is None
@@ -468,21 +475,20 @@ def open_url(url, success_message):
         )
         return False
 
+    if os.name == "nt":
+        try:
+            os.startfile(url)
+            respond(success_message)
+            return True
+        except OSError as error:
+            print(f"Default browser error ({type(error).__name__}): {error}")
+
     try:
         browser_controller.navigate(url)
         respond(success_message)
         return True
     except Exception as error:
         print(f"Managed browser error ({type(error).__name__}): {error}")
-
-    startfile_error = None
-    if os.name == "nt":
-        try:
-            os.startfile(url)
-            respond(success_message)
-            return True
-        except Exception as error:
-            startfile_error = error
 
     try:
         if webbrowser.open_new_tab(url):
@@ -492,11 +498,6 @@ def open_url(url, success_message):
     except Exception as error:
         fallback_error = f"{type(error).__name__}: {error}"
 
-    if startfile_error is not None:
-        print(
-            "Browser start error "
-            f"({type(startfile_error).__name__}): {startfile_error}"
-        )
     print(f"Browser fallback error: {fallback_error}")
     respond(
         "I could not open the browser. Please check your default browser settings."

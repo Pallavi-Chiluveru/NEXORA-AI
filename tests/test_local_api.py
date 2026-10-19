@@ -64,6 +64,25 @@ class LocalApiTests(unittest.TestCase):
         self.assertEqual(calls, ["https://www.youtube.com"])
         self.assertEqual(response.json()["message"], "Opening YouTube now.")
 
+    def test_open_url_prefers_windows_default_browser_for_websites(self):
+        responses = []
+        with (
+            patch.object(local_api.main.os, "startfile") as startfile,
+            patch.object(local_api.main, "respond", side_effect=responses.append),
+            patch.object(local_api.main.browser_controller, "navigate") as navigate,
+        ):
+            opened = local_api.main.open_url(
+                "https://www.youtube.com", "Opening YouTube now."
+            )
+
+        if os.name == "nt":
+            self.assertTrue(opened)
+            startfile.assert_called_once_with("https://www.youtube.com")
+            navigate.assert_not_called()
+            self.assertEqual(responses, ["Opening YouTube now."])
+        else:
+            startfile.assert_not_called()
+
     def test_unsupported_command_never_reaches_executor(self):
         with patch.object(local_api, "run_command") as execute:
             response = self.client.post("/api/actions/execute", json={"command": "run arbitrary shell code"})
@@ -80,7 +99,7 @@ class LocalApiTests(unittest.TestCase):
         calls = []
 
         class FakeMicrophone:
-            def __init__(self, ready_event, closed_event):
+            def __init__(self, ready_event, closed_event, device_index=None):
                 self.stream_available = True
                 self.closed_event = closed_event
                 self.error = None
@@ -102,6 +121,43 @@ class LocalApiTests(unittest.TestCase):
         self.assertTrue(started.json()["ok"])
         self.assertEqual(stopped.status_code, 200)
         self.assertEqual(calls, ["start", "stop"])
+
+    def test_microphone_device_index_is_configurable(self):
+        captured = []
+
+        class FakeMicrophone:
+            def __init__(self, ready_event, closed_event, device_index=None):
+                captured.append(device_index)
+                self.stream_available = True
+                self.closed_event = closed_event
+                self.error = None
+                ready_event.set()
+
+        def start_listener(*args, **kwargs):
+            def stop(**options):
+                args[0].closed_event.set()
+                local_api.voice_capture_active = False
+            return stop
+
+        with (
+            patch.dict(os.environ, {"MICROPHONE_DEVICE_INDEX": "2"}),
+            patch.object(local_api, "TrackedMicrophone", FakeMicrophone),
+            patch.object(local_api.main.recognizer, "listen_in_background", side_effect=start_listener),
+        ):
+            response = self.client.post("/api/voice/start", json={})
+            self.client.post("/api/voice/stop")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured, [2])
+
+    def test_invalid_microphone_device_index_returns_actionable_error(self):
+        with patch.dict(os.environ, {"MICROPHONE_DEVICE_INDEX": "not-a-number"}):
+            response = self.client.post("/api/voice/start", json={})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["ok"])
+        self.assertIn("microphone", response.json()["message"].lower())
+        self.assertFalse(local_api.state["voice_running"])
 
     def test_microphone_open_failure_returns_actionable_diagnostic(self):
         with patch.object(local_api.main.recognizer, "listen_in_background", side_effect=OSError("No Default Input Device Available")):

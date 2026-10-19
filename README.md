@@ -465,7 +465,9 @@ the authenticated user. The local desktop dashboard continues to use SQLite.
 
 ### Vercel frontend
 
-Set `VITE_API_BASE_URL` to the deployed public API URL ending in `/api`,
+Set `VITE_API_BASE_URL` to the deployed public API URL ending in `/api`
+(without a trailing slash after `api`), for example
+`https://nexora-ai-api.onrender.com/api`,
 and do not add MongoDB or JWT secrets to Vercel. Authentication is handled by
 the FastAPI backend using secure cookies.
 Then build the `frontend` directory with:

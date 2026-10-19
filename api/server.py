@@ -55,8 +55,8 @@ voice_capture_active = False
 class TrackedMicrophone(main.sr.Microphone):
     """Report the result of the stream opened by the background listener."""
 
-    def __init__(self, ready_event, closed_event):
-        super().__init__()
+    def __init__(self, ready_event, closed_event, device_index=None):
+        super().__init__(device_index=device_index)
         self.ready_event = ready_event
         self.closed_event = closed_event
         self.stream_available = False
@@ -66,6 +66,8 @@ class TrackedMicrophone(main.sr.Microphone):
         try:
             source = super().__enter__()
             self.stream_available = self.stream is not None
+            if self.stream_available:
+                main.recognizer.adjust_for_ambient_noise(source, duration=0.5)
             return source
         except Exception as error:
             self.error = error
@@ -102,6 +104,16 @@ def microphone_failure_message(error):
     if "timeout" in message:
         return "Opening the microphone timed out. Check that a Windows recording device is connected and try again."
     return "The microphone could not be opened. Check Windows microphone permissions and recording-device settings, then try again."
+
+
+def configured_microphone_index():
+    value = os.getenv("MICROPHONE_DEVICE_INDEX", "").strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError as error:
+        raise RuntimeError("MICROPHONE_DEVICE_INDEX must be an integer") from error
 
 
 class ChatRequest(BaseModel):
@@ -374,7 +386,11 @@ def start_voice(request: VoiceStartRequest = VoiceStartRequest()):
     closed_event = threading.Event()
     try:
         ready_event = threading.Event()
-        microphone = TrackedMicrophone(ready_event, closed_event)
+        microphone = TrackedMicrophone(
+            ready_event,
+            closed_event,
+            device_index=configured_microphone_index(),
+        )
         voice_microphone = microphone
         stopper = main.recognizer.listen_in_background(
             microphone,
