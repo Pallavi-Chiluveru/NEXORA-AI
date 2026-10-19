@@ -116,6 +116,44 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(unavailable.status_code, 503)
         self.assertNotIn("simulated database outage", unavailable.text)
 
+    def test_production_origin_passes_credentialed_preflight(self):
+        cors_middleware = next(
+            middleware
+            for middleware in public_server.app.user_middleware
+            if middleware.cls.__name__ == "CORSMiddleware"
+        )
+        original_origins = cors_middleware.kwargs["allow_origins"]
+        original_stack = public_server.app.middleware_stack
+        cors_middleware.kwargs["allow_origins"] = [
+            "https://nexora-ai-two-smoky.vercel.app"
+        ]
+        public_server.app.middleware_stack = None
+        try:
+            response = self.client.options(
+                "/api/auth/login",
+                headers={
+                    "Origin": "https://nexora-ai-two-smoky.vercel.app",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "content-type",
+                },
+            )
+        finally:
+            cors_middleware.kwargs["allow_origins"] = original_origins
+            public_server.app.middleware_stack = original_stack
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.headers["access-control-allow-origin"],
+            "https://nexora-ai-two-smoky.vercel.app",
+        )
+        self.assertEqual(
+            response.headers["access-control-allow-credentials"], "true"
+        )
+        self.assertIn("POST", response.headers["access-control-allow-methods"])
+        self.assertIn("PUT", response.headers["access-control-allow-methods"])
+        self.assertIn(
+            "Content-Type", response.headers["access-control-allow-headers"]
+        )
 
 if __name__ == "__main__":
     unittest.main()
